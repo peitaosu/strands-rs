@@ -11,8 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-# Re-export the macros
-strands-agents-macros = { path = "../strands-macros", optional = true }
+strands-agents-macros = { version = "0.1.0", path = "../strands-macros", optional = true }
 
 # Async runtime
 tokio = { workspace = true }
