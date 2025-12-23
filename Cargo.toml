@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "strands",
+    "strands-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Tony Su"]
+license = "MIT"
+repository = "https://github.com/peitaosu/strands-rs"
+documentation = "https://docs.rs/strands-agents"
+homepage = "https://strandsagents.com"
+description = "A Rust implementation of the Strands AI Agents SDK"
+keywords = ["ai", "agents", "llm", "bedrock", "strands"]
+categories = ["development-tools", "asynchronous", "api-bindings"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+pin-project-lite = "0.2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Schema generation
+schemars = "0.8"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# AWS SDK (for Bedrock and S3)
+aws-sdk-bedrockruntime = "1.0"
+aws-sdk-s3 = "1.0"
+aws-config = "1.0"
+aws-smithy-types = "1.0"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# OpenTelemetry
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-stdout = { version = "0.28", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.28", features = ["trace", "metrics", "grpc-tonic"] }
+
+# Procedural macros
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+# Testing
+tokio-test = "0.4"
+

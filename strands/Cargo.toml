@@ -1,0 +1,74 @@
+[package]
+name = "strands-agents"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A Rust implementation of the Strands AI Agents SDK"
+readme = "../README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Re-export the macros
+strands-agents-macros = { path = "../strands-macros", optional = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+pin-project-lite = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Schema generation
+schemars = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Base64 encoding
+base64 = { workspace = true }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-stdout = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+
+# AWS SDK (always compiled for Bedrock)
+aws-sdk-bedrockruntime = { workspace = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true }
+aws-smithy-types = { workspace = true }
+
+# HTTP client (always compiled for all HTTP-based model providers)
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = ["macros"]
+macros = ["strands-agents-macros"]
+s3-session = ["aws-sdk-s3"]
+otel-stdout = ["opentelemetry-stdout"]
+otel-otlp = ["opentelemetry-otlp"]
+otel = ["otel-stdout", "otel-otlp"]
+full = ["macros", "s3-session", "otel"]
+
