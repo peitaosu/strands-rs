@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-strands-agents-macros = { version = "0.1.0", path = "../strands-macros", optional = true }
+strands-agents-macros = { version = "0.2.0", path = "../strands-macros", optional = true }
 
 # Async runtime
 tokio = { workspace = true }
