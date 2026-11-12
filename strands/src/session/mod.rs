@@ -1,6 +1,9 @@
 //! Session management for persistent conversations.
 
 mod s3_session_manager;
+mod snapshot_session_manager;
+
+pub use snapshot_session_manager::{SaveLatestStrategy, SnapshotSessionManager};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

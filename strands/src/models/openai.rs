@@ -11,7 +11,8 @@ use crate::types::{
     streaming::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockDeltaToolUse, ContentBlockStart,
         ContentBlockStartEvent, ContentBlockStartToolUse, ContentBlockStopEvent, MessageStartEvent,
-        MessageStopEvent, MetadataEvent, Metrics, StopReason, StreamEvent, Usage,
+        MessageStopEvent, MetadataEvent, Metrics, ReasoningContentBlockDelta, StopReason,
+        StreamEvent, Usage,
     },
     tools::{ToolChoice, ToolSpec},
 };
@@ -115,6 +116,10 @@ struct OpenAIChoice {
 struct OpenAIDelta {
     content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -357,7 +362,14 @@ impl Model for OpenAIModel {
             let mut buffer = String::new();
 
             loop {
-                for line in buffer.lines() {
+                match byte_stream.next().await {
+                    Some(Ok(bytes)) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    }
+                    _ => break,
+                }
+
+                for line in super::drain_complete_lines(&mut buffer) {
                     let line = line.trim();
                     if line.is_empty() || line == "data: [DONE]" {
                         continue;
@@ -370,6 +382,27 @@ impl Model for OpenAIModel {
                             }
 
                             for choice in chunk.choices {
+                                if let Some(ref reasoning) = choice
+                                    .delta
+                                    .reasoning_content
+                                    .as_deref()
+                                    .or(choice.delta.reasoning.as_deref())
+                                {
+                                    yield Ok(StreamEvent {
+                                        content_block_delta: Some(ContentBlockDeltaEvent {
+                                            content_block_index: Some(0),
+                                            delta: Some(ContentBlockDelta {
+                                                reasoning_content: Some(ReasoningContentBlockDelta {
+                                                    text: Some(reasoning.to_string()),
+                                                    ..Default::default()
+                                                }),
+                                                ..Default::default()
+                                            }),
+                                        }),
+                                        ..Default::default()
+                                    });
+                                }
+
                                 if let Some(ref content) = choice.delta.content {
                                     if !content_started {
                                         yield Ok(StreamEvent {
@@ -419,13 +452,6 @@ impl Model for OpenAIModel {
                             }
                         }
                     }
-                }
-
-                match byte_stream.next().await {
-                    Some(Ok(bytes)) => {
-                        buffer = String::from_utf8_lossy(&bytes).to_string();
-                    }
-                    _ => break,
                 }
             }
 

@@ -57,6 +57,9 @@ pub struct ContentBlock {
     pub cache_point: Option<CachePoint>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SummaryBlock>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub guard_content: Option<GuardContent>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +171,16 @@ pub struct ReasoningTextBlock {
 pub struct CachePoint {
     #[serde(rename = "type")]
     pub cache_type: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+/// A summarized content block produced by conversation management.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryBlock {
+    pub summary: String,
 }
 
 /// Content that has been processed by guardrails.
@@ -185,27 +198,93 @@ pub struct GuardContentText {
     pub text: String,
 }
 
+/// Metadata attached to a message by the event loop.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::types::streaming::Usage>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::types::streaming::Metrics>,
+
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub custom: std::collections::HashMap<String, serde_json::Value>,
+}
+
 /// A message in a conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MessageMetadata>,
 }
 
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, content: vec![ContentBlock::text(text)] }
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::text(text)],
+            tracking_id: None,
+            metadata: None,
+        }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: vec![ContentBlock::text(text)] }
+        Self {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text(text)],
+            tracking_id: None,
+            metadata: None,
+        }
     }
 
     pub fn new(role: Role, content: Vec<ContentBlock>) -> Self {
-        Self { role, content }
+        Self { role, content, tracking_id: None, metadata: None }
     }
 
+    pub fn with_tracking_id(mut self, tracking_id: impl Into<String>) -> Self {
+        self.tracking_id = Some(tracking_id.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: MessageMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Assigns a monotonic UUIDv7 tracking id when none is present and returns it.
+    pub fn ensure_tracking_id(&mut self) -> String {
+        if let Some(id) = &self.tracking_id {
+            return id.clone();
+        }
+        let id = crate::identifier::new_uuid7();
+        self.tracking_id = Some(id.clone());
+        id
+    }
+
+    /// Strips event-loop-only fields, matching the projection models receive.
+    pub fn to_model_message(&self) -> Message {
+        Message {
+            role: self.role,
+            content: self.content.clone(),
+            tracking_id: None,
+            metadata: None,
+        }
+    }
+}
+
+impl Default for Message {
+    fn default() -> Self { Self::new(Role::User, Vec::new()) }
+}
+
+impl Message {
     pub fn text_content(&self) -> String {
         self.content.iter().filter_map(|b| b.as_text()).collect::<Vec<_>>().join("")
     }

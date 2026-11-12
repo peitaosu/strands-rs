@@ -67,7 +67,7 @@ pub fn warn_on_tool_choice_not_supported(tool_choice: Option<&ToolChoice>, provi
 }
 
 /// Common valid configuration keys for model providers.
-pub mod config_keys {
+    pub mod config_keys {
     use std::collections::HashSet;
 
     /// Base configuration keys common to most providers.
@@ -90,7 +90,10 @@ pub mod config_keys {
             "guardrail_trace",
             "cache_prompt",
             "cache_tools",
+            "cache_config",
+            "service_tier",
             "include_tool_result_status",
+            "streaming",
             "additional_request_fields",
             "additional_response_field_paths",
         ]);
@@ -108,6 +111,8 @@ pub mod config_keys {
             "presence_penalty",
             "seed",
             "response_format",
+            "cache_config",
+            "bedrock_mantle_config",
         ]);
         keys
     }
@@ -128,6 +133,9 @@ pub mod config_keys {
         keys.extend([
             "host",
             "timeout",
+            "keep_alive",
+            "additional_args",
+            "cache_config",
         ]);
         keys
     }
@@ -170,6 +178,8 @@ mod tests {
         assert!(keys.contains("model_id"));
         assert!(keys.contains("guardrail_id"));
         assert!(keys.contains("cache_prompt"));
+        assert!(keys.contains("cache_config"));
+        assert!(keys.contains("service_tier"));
     }
 }
 

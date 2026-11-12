@@ -289,6 +289,108 @@ pub fn sanitize_tool_name(name: &str) -> String {
     }
 }
 
+/// Maximum nesting depth accepted for tool input schemas.
+pub const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// Keywords that express schema composition; presence suppresses type defaults.
+const COMPOSITION_KEYWORDS: [&str; 4] = ["anyOf", "oneOf", "allOf", "not"];
+
+/// Normalizes a JSON schema to match provider expectations.
+///
+/// Port of the Python `normalize_schema`: ensures `type: object`,
+/// `properties`, and `required` exist, and backfills property
+/// `type`/`description` defaults recursively.
+pub fn normalize_schema(schema: &serde_json::Value) -> Result<serde_json::Value, StrandsError> {
+    normalize_schema_at_depth(schema, 0)
+}
+
+fn normalize_schema_at_depth(
+    schema: &serde_json::Value,
+    depth: usize,
+) -> Result<serde_json::Value, StrandsError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(StrandsError::ToolValidationError {
+            message: format!("tool inputSchema nesting exceeds {} levels", MAX_SCHEMA_DEPTH),
+        });
+    }
+
+    let Some(object) = schema.as_object() else {
+        return Ok(schema.clone());
+    };
+
+    let mut normalized = object.clone();
+    normalized
+        .entry("type")
+        .or_insert(serde_json::Value::String("object".to_string()));
+    normalized
+        .entry("properties")
+        .or_insert(serde_json::json!({}));
+    normalized
+        .entry("required")
+        .or_insert(serde_json::json!([]));
+
+    if let Some(properties) = normalized
+        .get("properties")
+        .cloned()
+        .and_then(|p| p.as_object().cloned())
+    {
+        let mut normalized_properties = serde_json::Map::new();
+        for (prop_name, prop_def) in properties {
+            normalized_properties.insert(
+                prop_name.clone(),
+                normalize_property(&prop_name, &prop_def, depth)?,
+            );
+        }
+        normalized.insert("properties".to_string(), serde_json::Value::Object(normalized_properties));
+    }
+
+    Ok(serde_json::Value::Object(normalized))
+}
+
+fn normalize_property(
+    prop_name: &str,
+    prop_def: &serde_json::Value,
+    depth: usize,
+) -> Result<serde_json::Value, StrandsError> {
+    let Some(prop_object) = prop_def.as_object() else {
+        return Ok(serde_json::json!({
+            "type": "string",
+            "description": format!("Property {}", prop_name),
+        }));
+    };
+
+    if prop_object.get("type").and_then(|t| t.as_str()) == Some("object")
+        && prop_object.contains_key("properties")
+    {
+        return normalize_schema_at_depth(prop_def, depth + 1);
+    }
+
+    let mut normalized_prop = prop_object.clone();
+
+    if normalized_prop.contains_key("$ref") {
+        return Ok(serde_json::Value::Object(normalized_prop));
+    }
+
+    let has_composition = COMPOSITION_KEYWORDS.iter().any(|kw| normalized_prop.contains_key(*kw));
+    if !has_composition {
+        normalized_prop
+            .entry("type")
+            .or_insert(serde_json::Value::String("string".to_string()));
+    }
+    normalized_prop
+        .entry("description")
+        .or_insert(serde_json::Value::String(format!("Property {}", prop_name)));
+
+    Ok(serde_json::Value::Object(normalized_prop))
+}
+
+/// Normalizes a complete tool specification's input schema.
+pub fn normalize_tool_spec(spec: &ToolSpec) -> Result<ToolSpec, StrandsError> {
+    let mut normalized = spec.clone();
+    normalized.input_schema.json = normalize_schema(&spec.input_schema.json)?;
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +503,90 @@ mod tests {
         assert_eq!(sanitize_tool_name("invalid tool"), "invalid_tool");
         assert_eq!(sanitize_tool_name("test@#$"), "test___");
         assert_eq!(sanitize_tool_name(""), "unnamed_tool");
+    }
+
+    #[test]
+    fn test_normalize_schema_defaults() {
+        let schema = serde_json::json!({});
+        let normalized = normalize_schema(&schema).unwrap();
+
+        assert_eq!(normalized["type"], "object");
+        assert!(normalized["properties"].as_object().unwrap().is_empty());
+        assert!(normalized["required"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_normalize_property_defaults() {
+        let schema = serde_json::json!({
+            "properties": {
+                "count": {"type": "integer"},
+                "mystery": {}
+            }
+        });
+        let normalized = normalize_schema(&schema).unwrap();
+
+        let properties = normalized["properties"].as_object().unwrap();
+        assert_eq!(properties["count"]["type"], "integer");
+        assert_eq!(properties["count"]["description"], "Property count");
+        assert_eq!(properties["mystery"]["type"], "string");
+        assert_eq!(properties["mystery"]["description"], "Property mystery");
+    }
+
+    #[test]
+    fn test_normalize_composition_skips_type_default() {
+        let schema = serde_json::json!({
+            "properties": {
+                "either": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            }
+        });
+        let normalized = normalize_schema(&schema).unwrap();
+        let either = &normalized["properties"]["either"];
+        assert!(either.get("type").is_none());
+        assert!(either.get("anyOf").is_some());
+    }
+
+    #[test]
+    fn test_normalize_preserves_refs() {
+        let schema = serde_json::json!({
+            "properties": {
+                "thing": {"$ref": "#/$defs/Thing"}
+            }
+        });
+        let normalized = normalize_schema(&schema).unwrap();
+        assert_eq!(normalized["properties"]["thing"]["$ref"], "#/$defs/Thing");
+    }
+
+    #[test]
+    fn test_normalize_nested_objects_recurse() {
+        let schema = serde_json::json!({
+            "properties": {
+                "nested": {"type": "object", "properties": {"inner": {}}}
+            }
+        });
+        let normalized = normalize_schema(&schema).unwrap();
+        let inner = &normalized["properties"]["nested"]["properties"]["inner"];
+        assert_eq!(inner["type"], "string");
+    }
+
+    #[test]
+    fn test_normalize_schema_depth_guard() {
+        let mut deep = serde_json::json!({"type": "object", "properties": {}});
+        for _ in 0..MAX_SCHEMA_DEPTH + 2 {
+            deep = serde_json::json!({
+                "type": "object",
+                "properties": {"child": deep}
+            });
+        }
+
+        let schema = serde_json::json!({"properties": {"deep": deep}});
+        assert!(normalize_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn test_normalize_tool_spec() {
+        let spec = ToolSpec::new("t", "d");
+        let normalized = normalize_tool_spec(&spec).unwrap();
+        assert_eq!(normalized.input_schema.json["type"], "object");
     }
 }
 

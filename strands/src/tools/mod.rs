@@ -4,7 +4,9 @@ pub mod executor;
 pub mod helpers;
 pub mod loader;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod mcp_instrumentation;
+pub mod mcp_tasks;
 pub mod registry;
 pub mod structured_output;
 pub mod validator;
@@ -55,41 +57,78 @@ impl ToolEvent {
 }
 
 /// State passed through tool invocations.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+///
+/// The data map is shared across clones and mutable through `&self`,
+/// mirroring the Python invocation-state dict that tools update live.
+#[derive(Debug, Clone, Default)]
 pub struct InvocationState {
-    pub data: std::collections::HashMap<String, serde_json::Value>,
-    #[serde(default)]
-    pub stop_event_loop: bool,
+    data: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>>,
+    stop_event_loop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InvocationState {
     pub fn new() -> Self { Self::default() }
 
     pub fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.data.get(key).and_then(|v| T::deserialize(v).ok())
+        self.data
+            .read()
+            .unwrap()
+            .get(key)
+            .and_then(|v| T::deserialize(v).ok())
     }
 
-    pub fn set(&mut self, key: impl Into<String>, value: impl serde::Serialize) {
+    pub fn set(&self, key: impl Into<String>, value: impl serde::Serialize) {
         if let Ok(v) = serde_json::to_value(value) {
-            self.data.insert(key.into(), v);
+            self.data.write().unwrap().insert(key.into(), v);
         }
+    }
+
+    /// Returns a snapshot of the state map.
+    pub fn get_all(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        self.data.read().unwrap().clone()
+    }
+
+    /// Requests the event loop stop after the current tool cycle.
+    pub fn request_stop(&self) {
+        self.stop_event_loop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns true when a stop was requested, via the flag or the legacy
+    /// `stop_event_loop` data key.
+    pub fn should_stop(&self) -> bool {
+        self.stop_event_loop
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .data
+                .read()
+                .unwrap()
+                .get("stop_event_loop")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+    }
+}
+
+impl serde::Serialize for InvocationState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.data.read().unwrap().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InvocationState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let data = std::collections::HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        Ok(Self {
+            data: std::sync::Arc::new(std::sync::RwLock::new(data)),
+            stop_event_loop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
     }
 }
 
 /// Context provided to tool execution.
-#[derive(Debug, Clone, Default)]
-pub struct ToolContext {
-    pub invocation_state: InvocationState,
-    pub interrupt_id: Option<uuid::Uuid>,
-}
-
-impl ToolContext {
-    pub fn new() -> Self { Self::default() }
-
-    pub fn with_state(state: InvocationState) -> Self {
-        Self { invocation_state: state, interrupt_id: None }
-    }
-}
+///
+/// Alias for the canonical [`crate::types::tools::ToolContext`].
+pub use crate::types::tools::ToolContext;
 
 /// Result returned from async tool invocation.
 #[derive(Debug, Clone)]
@@ -169,7 +208,7 @@ pub fn tool_to_stream(
 ) -> ToolGenerator {
     let input = tool_use.input.clone();
     let tool_use_id = tool_use.tool_use_id.clone();
-    let context = ToolContext::with_state(invocation_state);
+    let context = ToolContext::with_state(tool_use, invocation_state);
 
     Box::pin(async_stream::stream! {
         let result = match tool.invoke(input, &context).await {
@@ -204,6 +243,11 @@ pub fn execute_tool_stream(
 }
 
 pub use loader::{ReloadCallback, ToolLoader, ToolLoaderConfig, ToolWatcher};
+pub use mcp_auth::{BearerTokenSource, MCPClientCredentials};
+pub use mcp_tasks::{
+    parse_task, task_params, tasks_get_params, MCPTask, MCPTaskState, TasksConfig,
+    DEFAULT_POLL_INTERVAL, TASKS_EXTENSION, TASKS_PROTOCOL_VERSION, TERMINAL_STATES,
+};
 pub use mcp::{
     ConnectionState, MCPClient, MCPImageContent, MCPImageSource, MCPResultContent,
     MCPServerConfig, MCPToolResult, MCPToolSpec, MCPTransport, ToolFilters, ToolProvider,

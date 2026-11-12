@@ -13,8 +13,14 @@ pub enum StopReason {
     MaxTokens,
     StopSequence,
     ContentFiltered,
-    GuardrailIntervention,
+    GuardrailIntervened,
     Interrupt,
+    Cancelled,
+    Checkpoint,
+    LimitTurns,
+    LimitTotalTokens,
+    LimitOutputTokens,
+    LimitStructuredOutputAttempts,
 }
 
 impl Default for StopReason {
@@ -30,9 +36,26 @@ impl StopReason {
             StopReason::MaxTokens => "max_tokens",
             StopReason::StopSequence => "stop_sequence",
             StopReason::ContentFiltered => "content_filtered",
-            StopReason::GuardrailIntervention => "guardrail_intervention",
+            StopReason::GuardrailIntervened => "guardrail_intervened",
             StopReason::Interrupt => "interrupt",
+            StopReason::Cancelled => "cancelled",
+            StopReason::Checkpoint => "checkpoint",
+            StopReason::LimitTurns => "limit_turns",
+            StopReason::LimitTotalTokens => "limit_total_tokens",
+            StopReason::LimitOutputTokens => "limit_output_tokens",
+            StopReason::LimitStructuredOutputAttempts => "limit_structured_output_attempts",
         }
+    }
+
+    /// Returns true when the stop reason was produced by an invocation limit.
+    pub fn is_limit(&self) -> bool {
+        matches!(
+            self,
+            StopReason::LimitTurns
+                | StopReason::LimitTotalTokens
+                | StopReason::LimitOutputTokens
+                | StopReason::LimitStructuredOutputAttempts
+        )
     }
 }
 
@@ -413,6 +436,24 @@ mod tests {
     fn test_stop_reason_serialization() {
         assert_eq!(serde_json::to_string(&StopReason::EndTurn).unwrap(), "\"end_turn\"");
         assert_eq!(serde_json::to_string(&StopReason::ToolUse).unwrap(), "\"tool_use\"");
+        assert_eq!(
+            serde_json::to_string(&StopReason::GuardrailIntervened).unwrap(),
+            "\"guardrail_intervened\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::LimitStructuredOutputAttempts).unwrap(),
+            "\"limit_structured_output_attempts\""
+        );
+    }
+
+    #[test]
+    fn test_stop_reason_limit_flags() {
+        assert!(StopReason::LimitTurns.is_limit());
+        assert!(StopReason::LimitTotalTokens.is_limit());
+        assert!(StopReason::LimitOutputTokens.is_limit());
+        assert!(StopReason::LimitStructuredOutputAttempts.is_limit());
+        assert!(!StopReason::EndTurn.is_limit());
+        assert!(!StopReason::Cancelled.is_limit());
     }
 
     #[test]

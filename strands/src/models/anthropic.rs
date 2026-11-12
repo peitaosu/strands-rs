@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use super::{Model, ModelConfig, StreamEventStream};
 use crate::types::{
@@ -11,13 +12,15 @@ use crate::types::{
     streaming::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockDeltaToolUse, ContentBlockStart,
         ContentBlockStartEvent, ContentBlockStartToolUse, ContentBlockStopEvent, MessageStartEvent,
-        MessageStopEvent, MetadataEvent, Metrics, StopReason, StreamEvent, Usage,
+        MessageStopEvent, MetadataEvent, Metrics, ReasoningContentBlockDelta, StopReason,
+        StreamEvent, Usage,
     },
     tools::{ToolChoice, ToolSpec},
 };
 
 const DEFAULT_MODEL_ID: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_COUNT_TOKENS_URL: &str = "https://api.anthropic.com/v1/messages/count_tokens";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Anthropic Claude model provider.
@@ -26,6 +29,7 @@ pub struct AnthropicModel {
     config: ModelConfig,
     api_key: String,
     max_tokens: u32,
+    base_url: Option<String>,
     client: Client,
 }
 
@@ -118,6 +122,12 @@ struct AnthropicDelta {
     text: Option<String>,
     #[serde(default)]
     partial_json: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,7 +148,27 @@ impl AnthropicModel {
             config: ModelConfig::new(DEFAULT_MODEL_ID),
             api_key: api_key.into(),
             max_tokens,
+            base_url: None,
             client: Client::new(),
+        }
+    }
+
+    /// Overrides the API endpoint (e.g. for tests or proxies).
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    fn messages_url(&self) -> String {
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| ANTHROPIC_API_URL.to_string())
+    }
+
+    fn count_tokens_url(&self) -> String {
+        match &self.base_url {
+            Some(base) => format!("{}/count_tokens", base.trim_end_matches('/')),
+            None => ANTHROPIC_COUNT_TOKENS_URL.to_string(),
         }
     }
 
@@ -256,6 +286,57 @@ impl Model for AnthropicModel {
         self.config = config;
     }
 
+    /// Counts input tokens through the native Anthropic count-tokens API.
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> Result<u64, StrandsError> {
+        let mut body = json!({
+            "model": self.config.model_id,
+            "messages": self.format_messages(messages),
+        });
+        if let Some(prompt) = system_prompt {
+            body["system"] = json!(prompt);
+        }
+
+        let response = self
+            .client
+            .post(self.count_tokens_url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-beta", "count-tokens-2024-11-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("anthropic count_tokens request failed: {}", e),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StrandsError::ProviderTokenCountError {
+                message: format!("anthropic count_tokens failed: HTTP {status}: {body}"),
+            });
+        }
+
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("failed to parse count_tokens response: {}", e),
+            })?;
+
+        payload
+            .get("input_tokens")
+            .and_then(|t| t.as_u64())
+            .map(|tokens| tokens)
+            .ok_or_else(|| StrandsError::ProviderTokenCountError {
+                message: "count_tokens response missing input_tokens".to_string(),
+            })
+    }
+
     fn stream<'a>(
         &'a self,
         messages: &'a [Message],
@@ -281,7 +362,7 @@ impl Model for AnthropicModel {
 
         Box::pin(async_stream::stream! {
             let response = match client
-                .post(ANTHROPIC_API_URL)
+                .post(self.messages_url())
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("Content-Type", "application/json")
@@ -326,10 +407,7 @@ impl Model for AnthropicModel {
 
                 buffer.push_str(&chunk);
 
-                let lines: Vec<String> = buffer.lines().map(String::from).collect();
-                buffer.clear();
-
-                for line in &lines {
+                for line in super::drain_complete_lines(&mut buffer) {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
@@ -372,19 +450,33 @@ impl Model for AnthropicModel {
                                 "content_block_delta" => {
                                     let index = event.index.unwrap_or(0) as u32;
                                     if let Some(ref delta) = event.delta {
-                                        let block_delta = match delta.delta_type.as_str() {
-                                            "text_delta" => ContentBlockDelta {
-                                                text: delta.text.clone(),
+                                    let block_delta = match delta.delta_type.as_str() {
+                                        "text_delta" => ContentBlockDelta {
+                                            text: delta.text.clone(),
+                                            ..Default::default()
+                                        },
+                                        "input_json_delta" => ContentBlockDelta {
+                                            tool_use: Some(ContentBlockDeltaToolUse {
+                                                input: delta.partial_json.clone().unwrap_or_default(),
+                                            }),
+                                            ..Default::default()
+                                        },
+                                        "thinking_delta" => ContentBlockDelta {
+                                            reasoning_content: Some(ReasoningContentBlockDelta {
+                                                text: delta.thinking.clone(),
                                                 ..Default::default()
-                                            },
-                                            "input_json_delta" => ContentBlockDelta {
-                                                tool_use: Some(ContentBlockDeltaToolUse {
-                                                    input: delta.partial_json.clone().unwrap_or_default(),
-                                                }),
+                                            }),
+                                            ..Default::default()
+                                        },
+                                        "signature_delta" => ContentBlockDelta {
+                                            reasoning_content: Some(ReasoningContentBlockDelta {
+                                                signature: delta.signature.clone(),
                                                 ..Default::default()
-                                            },
-                                            _ => ContentBlockDelta::default(),
-                                        };
+                                            }),
+                                            ..Default::default()
+                                        },
+                                        _ => ContentBlockDelta::default(),
+                                    };
 
                                         yield Ok(StreamEvent {
                                             content_block_delta: Some(ContentBlockDeltaEvent {
@@ -414,8 +506,8 @@ impl Model for AnthropicModel {
                                         });
                                     }
                                     if let Some(ref delta) = event.delta {
-                                        if let Some(ref text) = delta.text {
-                                            stop_reason_str = Some(text.clone());
+                                        if let Some(ref stop_reason) = delta.stop_reason {
+                                            stop_reason_str = Some(stop_reason.clone());
                                         }
                                     }
                                 }

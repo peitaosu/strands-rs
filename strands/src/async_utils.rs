@@ -1,8 +1,37 @@
 //! Private async execution utilities.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::runtime::Handle;
+
+/// Cooperative cancellation flag with `threading.Event` semantics.
+///
+/// The agent and tool executors share one signal so that `agent.cancel()`
+/// can stop in-flight model streams and pending tool calls.
+#[derive(Debug, Clone, Default)]
+pub struct CancelSignal(Arc<AtomicBool>);
+
+impl CancelSignal {
+    pub fn new() -> Self { Self(Arc::new(AtomicBool::new(false))) }
+
+    /// Marks the signal as cancelled.
+    pub fn set(&self) { self.0.store(true, Ordering::SeqCst); }
+
+    /// Alias for `set`, matching the Python `agent.cancel()` name.
+    pub fn cancel(&self) { self.set(); }
+
+    /// Returns true when cancellation has been requested.
+    pub fn is_set(&self) -> bool { self.0.load(Ordering::SeqCst) }
+
+    /// Resolves once cancellation has been requested.
+    pub async fn wait(&self) {
+        while !self.is_set() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
 
 /// Run an async function, handling event loop conflicts.
 ///

@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn test_noop_tool_execution() {
         let tool = noop_tool("test_noop");
-        let context = ToolContext::default();
+        let context = ToolContext::new(ToolUse::new("noop", "test", serde_json::json!({})));
         let result = tool.invoke(serde_json::json!({}), &context).await.unwrap();
         
         assert_eq!(result.status, ToolResultStatus::Success);
@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(tool.name(), "custom_noop");
         assert_eq!(tool.description(), "Custom description");
         
-        let context = ToolContext::default();
+        let context = ToolContext::new(ToolUse::new("noop", "test", serde_json::json!({})));
         let result = tool.invoke(serde_json::json!({}), &context).await.unwrap();
         
         assert_eq!(result.status, ToolResultStatus::Success);
@@ -279,10 +279,7 @@ mod tests {
     #[test]
     fn test_generate_missing_tool_results_for_message() {
         let tool_use = ToolUse::new("unknown_tool", "123", serde_json::json!({}));
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::tool_use(tool_use)],
-        };
+        let message = Message::new(Role::Assistant, vec![ContentBlock::tool_use(tool_use)]);
 
         let known_tools = vec!["known_tool_1", "known_tool_2"];
         let results = generate_missing_tool_results_for_message(&message, &known_tools);

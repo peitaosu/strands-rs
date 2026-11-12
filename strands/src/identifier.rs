@@ -57,6 +57,20 @@ pub fn validate(id: &str, type_: Identifier) -> Result<&str, String> {
     Ok(id)
 }
 
+/// Generate a new monotonic UUIDv7 identifier.
+///
+/// Mirrors the Python `_identifier.new_uuid7` used for message tracking ids.
+pub fn new_uuid7() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// Returns true when the value is a parseable UUIDv7.
+pub fn is_uuid7(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|u| u.get_version_num() == 7)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

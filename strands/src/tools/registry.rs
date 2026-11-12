@@ -132,10 +132,17 @@ impl ToolRegistry {
     }
 
     /// Registers a tool with the registry (typed version).
+    ///
+    /// Same-name re-registration is allowed when the existing tool supports
+    /// hot reload, mirroring the Python registry contract.
     pub fn register_typed(&mut self, tool: impl AgentTool + 'static) -> Result<(), StrandsError> {
         let name = tool.tool_name().to_string();
 
-        if self.tools.contains_key(&name) {
+        if let Some(existing) = self.tools.get(&name) {
+            if existing.supports_hot_reload() {
+                self.tools.insert(name, Arc::new(tool));
+                return Ok(());
+            }
             return Err(StrandsError::ConfigurationError {
                 message: format!("Tool '{name}' already exists"),
             });
@@ -176,9 +183,29 @@ impl ToolRegistry {
         self.tools.keys().chain(self.dynamic_tools.keys()).map(|s| s.as_str()).collect()
     }
 
-    /// Returns all tool specifications.
+    /// Returns all tool specifications, normalized per the Python contract.
+    ///
+    /// Specs failing validation or normalization are dropped with a warning
+    /// instead of failing the call, matching `ToolRegistry.get_all_tools_config`.
     pub fn get_all_tool_specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().chain(self.dynamic_tools.values()).map(|t| t.tool_spec()).collect()
+        self.tools
+            .values()
+            .chain(self.dynamic_tools.values())
+            .filter_map(|tool| {
+                let spec = tool.tool_spec();
+                match super::validator::normalize_tool_spec(&spec) {
+                    Ok(normalized) => Some(normalized),
+                    Err(e) => {
+                        tracing::warn!(
+                            tool_name = %tool.name(),
+                            error = %e,
+                            "Invalid tool specification, skipping"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Returns all tools as a configuration map.

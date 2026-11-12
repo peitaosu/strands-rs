@@ -547,7 +547,7 @@ impl Tracer {
             }
 
 
-            let usage = &resp.usage;
+            let usage = resp.usage().cloned().unwrap_or_default();
             attributes.extend(vec![
                 KeyValue::new("gen_ai.usage.prompt_tokens", usage.input_tokens as i64),
                 KeyValue::new("gen_ai.usage.completion_tokens", usage.output_tokens as i64),

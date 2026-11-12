@@ -359,6 +359,10 @@ pub struct StructuredOutputContext {
     pub stop_loop: bool,
 }
 
+/// Default prompt appended when forcing structured output.
+pub const DEFAULT_STRUCTURED_OUTPUT_PROMPT: &str =
+    "You must format the previous response as structured output.";
+
 impl StructuredOutputContext {
     /// Creates a new structured output context.
     pub fn new() -> Self {
@@ -469,6 +473,46 @@ impl StructuredOutputContext {
         }
         None
     }
+
+    /// Extracts a structured output from the message text as a fallback.
+    ///
+    /// Mirrors the Python forced-retry text validation: takes the last text
+    /// block, strips code fences, parses a JSON object, and validates it
+    /// against the tool spec when one is available.
+    pub fn result_from_text(&self, message: &crate::types::content::Message) -> Option<Value> {
+        let text = message
+            .content
+            .iter()
+            .rev()
+            .filter_map(|block| block.as_text())
+            .find(|t| !t.trim().is_empty())?;
+
+        let cleaned = strip_code_fences(text);
+        let value: Value = serde_json::from_str(cleaned).ok()?;
+        if !value.is_object() {
+            return None;
+        }
+
+        if let Some(spec) = &self.tool_spec {
+            let schema = flatten_schema(&spec.input_schema.json);
+            validate_against_schema(&value, &schema).ok()?;
+        }
+
+        Some(value)
+    }
+}
+
+/// Strips a wrapping markdown code fence from JSON text.
+fn strip_code_fences(text: &str) -> &str {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric());
+        let rest = rest.trim_start_matches(['\r', '\n']);
+        if let Some(end) = rest.rfind("```") {
+            return rest[..end].trim();
+        }
+    }
+    trimmed
 }
 
 #[cfg(test)]

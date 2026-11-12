@@ -46,8 +46,47 @@ pub enum StrandsError {
     ContextWindowOverflow { message: String },
 
     /// The model reached the maximum token limit.
-    #[error("Max tokens reached")]
-    MaxTokensReached,
+    #[error("Max tokens reached: {message}")]
+    MaxTokensReached { message: String },
+
+    /// An error raised inside the event loop carrying request state for resumption.
+    #[error("Event loop exception: {message}")]
+    EventLoopException {
+        message: String,
+        request_state: Option<serde_json::Map<String, serde_json::Value>>,
+    },
+
+    /// A concurrent invocation conflict was detected.
+    #[error("Concurrency exception: {message}")]
+    ConcurrencyException { message: String },
+
+    /// Structured output extraction or validation failed.
+    #[error("Structured output exception: {message}")]
+    StructuredOutputException { message: String },
+
+    /// A provider-native token count call failed.
+    #[error("Provider token count error: {message}")]
+    ProviderTokenCountError { message: String },
+
+    /// Snapshot capture or restore failed.
+    #[error("Snapshot exception: {message}")]
+    SnapshotException { message: String },
+
+    /// Checkpoint capture or restore failed.
+    #[error("Checkpoint exception: {message}")]
+    CheckpointException { message: String },
+
+    /// A storage backend operation failed.
+    #[error("Storage error: {message}")]
+    StorageError { message: String },
+
+    /// A sandbox execution error occurred.
+    #[error("Sandbox error: {message}")]
+    SandboxError { message: String },
+
+    /// Memory stores returned a mix of successes and failures.
+    #[error("Aggregate memory error: {message}")]
+    AggregateMemoryError { message: String },
 
     /// Content was filtered by safety systems.
     #[error("Content filtered: {message}")]

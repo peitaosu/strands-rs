@@ -527,7 +527,7 @@ impl Swarm {
         let task_str = task.to_string_lossy();
 
         Box::pin(async_stream::stream! {
-            self.hooks.invoke(&HookEvent::BeforeInvocation(BeforeInvocationEvent)).await;
+            self.hooks.fire_and_forget(HookEvent::BeforeInvocation(BeforeInvocationEvent::default())).await;
 
             if self.resume_from_session || self.interrupt_state.activated {
                 self.state.status = Status::Executing;
@@ -571,9 +571,10 @@ impl Swarm {
 
                 yield MultiAgentEvent::node_start(&current_node_id, "agent");
 
-                self.hooks.invoke(&HookEvent::BeforeToolCall(BeforeToolCallEvent::new(
+                let (before_event, _) = self.hooks.fire(HookEvent::BeforeToolCall(BeforeToolCallEvent::new(
                     ToolUse::new(&current_node_id, &current_node_id, serde_json::json!({}))
                 ))).await;
+                let _ = before_event;
 
                 let result = self.execute_node(&current_node_id, &task_str).await;
 
@@ -625,7 +626,7 @@ impl Swarm {
                     }
                 }
 
-                self.hooks.invoke(&HookEvent::AfterToolCall(AfterToolCallEvent::new(
+                let _ = self.hooks.fire(HookEvent::AfterToolCall(AfterToolCallEvent::new(
                     ToolUse::new(&current_node_id, &current_node_id, serde_json::json!({})),
                     ToolResultType::success(&current_node_id, "completed")
                 ))).await;
@@ -633,7 +634,7 @@ impl Swarm {
 
             self.state.execution_time_ms = self.state.start_time.elapsed().as_millis() as u64;
 
-            self.hooks.invoke(&HookEvent::AfterInvocation(AfterInvocationEvent::new(None))).await;
+            self.hooks.fire_and_forget(HookEvent::AfterInvocation(AfterInvocationEvent::new(None))).await;
 
             let result = MultiAgentResult {
                 status: self.state.status,
@@ -661,7 +662,7 @@ impl Swarm {
         let agent_result = node.agent.invoke_async(input.as_str()).await?;
         let execution_time_ms = start.elapsed().as_millis() as u64;
 
-        let usage = agent_result.usage.clone();
+        let usage = agent_result.usage().cloned().unwrap_or_default();
 
         Ok(NodeResult {
             result: NodeResultValue::Agent(agent_result),

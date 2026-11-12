@@ -9,6 +9,7 @@ pub mod events;
 pub mod guardrails;
 pub mod interrupt;
 pub mod media;
+pub mod snapshot;
 pub mod streaming;
 pub mod tools;
 pub mod traces;

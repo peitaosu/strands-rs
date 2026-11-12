@@ -3,8 +3,9 @@
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock as BedrockContentBlock, ConversationRole, InferenceConfiguration, Message as BedrockMessage,
-    SystemContentBlock as BedrockSystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolSpecification,
+    CachePointBlock, ContentBlock as BedrockContentBlock, ConversationRole, InferenceConfiguration,
+    Message as BedrockMessage, SystemContentBlock as BedrockSystemContentBlock, Tool, ToolConfiguration,
+    ToolInputSchema, ToolSpecification,
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::Document;
@@ -28,6 +29,7 @@ const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-4-20250514-v1:0";
 pub struct BedrockModel {
     config: ModelConfig,
     region: Option<String>,
+    cache_config: Option<crate::models::cache_config::CacheConfig>,
 }
 
 impl BedrockModel {
@@ -35,11 +37,16 @@ impl BedrockModel {
         Self {
             config: ModelConfig::new(model_id),
             region: None,
+            cache_config: None,
         }
     }
 
     pub fn with_config(config: ModelConfig) -> Self {
-        Self { config, region: None }
+        Self {
+            config,
+            region: None,
+            cache_config: None,
+        }
     }
 
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
@@ -47,20 +54,37 @@ impl BedrockModel {
         self
     }
 
+    /// Enables prompt caching with the given configuration.
+    pub fn with_cache_config(mut self, cache_config: crate::models::cache_config::CacheConfig) -> Self {
+        self.cache_config = Some(cache_config);
+        self
+    }
+
     fn format_messages(&self, messages: &[Message]) -> Vec<BedrockMessage> {
+        let cache_last_message = self
+            .cache_config
+            .as_ref()
+            .map(|config| config.messages_enabled())
+            .unwrap_or(false);
+
         messages
             .iter()
-            .map(|msg| {
+            .enumerate()
+            .map(|(index, msg)| {
                 let role = match msg.role {
                     Role::User => ConversationRole::User,
                     Role::Assistant => ConversationRole::Assistant,
                 };
 
-                let content_blocks: Vec<BedrockContentBlock> = msg
+                let mut content_blocks: Vec<BedrockContentBlock> = msg
                     .content
                     .iter()
                     .filter_map(|block| self.format_content_block(block))
                     .collect();
+
+                if cache_last_message && index + 1 == messages.len() {
+                    content_blocks.push(self.cache_point_block());
+                }
 
                 BedrockMessage::builder()
                     .role(role)
@@ -69,6 +93,17 @@ impl BedrockModel {
                     .expect("valid message")
             })
             .collect()
+    }
+
+    /// The Bedrock cache-point block. The SDK in use does not expose cache
+    /// point TTLs, so the configured `ttl_value` is advisory only.
+    fn cache_point_block(&self) -> BedrockContentBlock {
+        BedrockContentBlock::CachePoint(
+            CachePointBlock::builder()
+                .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                .build()
+                .expect("valid cache point"),
+        )
     }
 
     fn json_to_document(value: &serde_json::Value) -> Document {
@@ -170,7 +205,24 @@ impl BedrockModel {
     }
 
     fn format_system_prompt(&self, system_prompt: Option<&str>) -> Option<Vec<BedrockSystemContentBlock>> {
-        system_prompt.map(|s| vec![BedrockSystemContentBlock::Text(s.to_string())])
+        let cache_system = self
+            .cache_config
+            .as_ref()
+            .map(|config| config.system_prompt_enabled())
+            .unwrap_or(false);
+
+        system_prompt.map(|s| {
+            let mut blocks = vec![BedrockSystemContentBlock::Text(s.to_string())];
+            if cache_system {
+                blocks.push(BedrockSystemContentBlock::CachePoint(
+                    CachePointBlock::builder()
+                        .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                        .build()
+                        .expect("valid cache point"),
+                ));
+            }
+            blocks
+        })
     }
 
     fn map_stop_reason(reason: &aws_sdk_bedrockruntime::types::StopReason) -> StopReason {
@@ -180,7 +232,7 @@ impl BedrockModel {
             aws_sdk_bedrockruntime::types::StopReason::MaxTokens => StopReason::MaxTokens,
             aws_sdk_bedrockruntime::types::StopReason::StopSequence => StopReason::StopSequence,
             aws_sdk_bedrockruntime::types::StopReason::ContentFiltered => StopReason::ContentFiltered,
-            aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened => StopReason::GuardrailIntervention,
+            aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened => StopReason::GuardrailIntervened,
             _ => StopReason::EndTurn,
         }
     }
@@ -200,6 +252,42 @@ impl Model for BedrockModel {
 
     fn update_config(&mut self, config: ModelConfig) {
         self.config = config;
+    }
+
+    /// Counts input tokens through the native Bedrock `CountTokens` API.
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> Result<u64, StrandsError> {
+        let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
+        if let Some(ref region) = self.region {
+            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
+        }
+        let sdk_config = config_loader.load().await;
+        let client = Client::new(&sdk_config);
+
+        let converse_request = aws_sdk_bedrockruntime::types::ConverseTokensRequest::builder()
+            .set_messages(Some(self.format_messages(messages)));
+
+        let converse_request = if let Some(system) = self.format_system_prompt(system_prompt) {
+            converse_request.set_system(Some(system))
+        } else {
+            converse_request
+        }
+        .build();
+
+        let output = client
+            .count_tokens()
+            .model_id(&self.config.model_id)
+            .input(aws_sdk_bedrockruntime::types::CountTokensInput::Converse(converse_request))
+            .send()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("bedrock count_tokens failed: {}", e),
+            })?;
+
+        Ok(output.input_tokens().max(0) as u64)
     }
 
     fn stream<'a>(

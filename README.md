@@ -14,6 +14,11 @@ A Rust implementation of the [Strands Agents SDK](https://strandsagents.com/) fo
 - **Multi-Provider Support** — AWS Bedrock, OpenAI, Anthropic, Ollama, and more
 - **Type-Safe Tools** — Define tools with the `#[tool]` macro
 - **Multi-Agent Patterns** — Graph and Swarm orchestration
+- **Middleware Stages** — Intercept model calls, tool executions, and agent passes
+- **Interruption & Cancellation** — Human-in-the-loop interrupts and cooperative cancel signals
+- **Invocation Limits** — Turn, token, and structured-output attempt limits with `limit_*` stop reasons
+- **Snapshots & Storage** — Versioned agent snapshots over pluggable blob storage
+- **Memory** — Pluggable memory stores with fan-out search and a `search_memory` tool
 - **Async-First** — Built on Tokio with streaming support
 - **OpenTelemetry Integration** — Built-in tracing and metrics
 
@@ -84,14 +89,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Module | Description |
 |--------|-------------|
-| `agent` | Core Agent interface |
-| `models` | Model providers (Bedrock, OpenAI, Anthropic, Ollama, etc.) |
-| `tools` | Tool definition, execution, and MCP support |
-| `multiagent` | Graph and Swarm patterns |
-| `hooks` | Lifecycle hooks |
-| `session` | Session persistence |
-| `conversation` | Context window management |
+| `agent` | Core Agent interface, event loop, and invocation limits |
+| `models` | Model providers, the shared model-info registry, routing, and cache config |
+| `tools` | Tool definition, execution, spec normalization, and MCP support |
+| `vended_tools` | Bundled tool families (loop control, files, shell, HTTP, notebook, subagent, router, orchestrators) |
+| `sandbox` | Execution environments: local host, Docker, and SSH |
+| `middleware` | InvokeModel / ExecuteTool / AgentStream middleware stages |
+| `multiagent` | Graph and Swarm patterns plus the A2A client and server |
+| `hooks` | Ordered lifecycle hooks with interrupt collection |
+| `plugins` | Reusable hook + tool bundles |
+| `interventions` | Guardrails bridged into the hook registry |
+| `session` | Session persistence (repository and snapshot managers) |
+| `storage` | Unified blob storage (in-memory and local file backends) |
+| `memory` | Memory stores and the memory manager |
+| `bidi` | Bidirectional streaming agent core and transports |
+| `background_tasks` | In-process async task runtime |
+| `conversation` | Context window management and truncation |
 | `telemetry` | Metrics and tracing |
+| `testing` | Scripted `MockModel` for tests |
 
 ## Testing
 

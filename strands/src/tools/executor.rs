@@ -83,7 +83,7 @@ impl ToolExecutor {
         tool_use: &ToolUse,
         invocation_state: &InvocationState,
     ) -> Vec<ToolEvent> {
-        let context = ToolContext::with_state(invocation_state.clone());
+        let context = ToolContext::with_state(tool_use.clone(), invocation_state.clone());
         let result = match tool.invoke(tool_use.input.clone(), &context).await {
             Ok(r) => ToolResult {
                 tool_use_id: tool_use.tool_use_id.clone(),

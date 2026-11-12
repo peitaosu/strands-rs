@@ -19,11 +19,18 @@ use crate::types::{
 const DEFAULT_MODEL_ID: &str = "llama3";
 const DEFAULT_HOST: &str = "http://localhost:11434";
 
+/// Response substrings that indicate a context-window overflow.
+const OLLAMA_OVERFLOW_MESSAGES: [&str; 2] = [
+    "input length exceeds context length",
+    "exceeds context length",
+];
+
 /// Ollama local model provider.
 #[derive(Clone)]
 pub struct OllamaModel {
     config: ModelConfig,
     host: String,
+    keep_alive: Option<String>,
     client: Client,
 }
 
@@ -43,6 +50,8 @@ struct OllamaRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<OllamaOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OllamaTool>,
 }
@@ -94,7 +103,9 @@ struct OllamaFunctionDef {
 
 #[derive(Debug, Deserialize)]
 struct OllamaStreamResponse {
+    #[serde(default)]
     message: OllamaResponseMessage,
+    #[serde(default)]
     done: bool,
     #[serde(default)]
     done_reason: Option<String>,
@@ -106,7 +117,7 @@ struct OllamaStreamResponse {
     total_duration: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct OllamaResponseMessage {
     #[serde(default)]
     content: String,
@@ -119,12 +130,19 @@ impl OllamaModel {
         Self {
             config: ModelConfig::new(model_id),
             host: DEFAULT_HOST.to_string(),
+            keep_alive: Some("5m".to_string()),
             client: Client::new(),
         }
     }
 
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
+        self
+    }
+
+    /// Sets how long the model stays loaded after a request (e.g. `"5m"`, `0`).
+    pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
+        self.keep_alive = Some(keep_alive.into());
         self
     }
 
@@ -251,6 +269,7 @@ impl Model for OllamaModel {
             messages: self.format_messages(messages, system_prompt),
             stream: true,
             options: Some(options),
+            keep_alive: self.keep_alive.clone(),
             tools: tool_specs.map(|s| self.format_tools(s)).unwrap_or_default(),
         };
 
@@ -272,7 +291,11 @@ impl Model for OllamaModel {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                yield Err(StrandsError::model_error(format!("HTTP {status}: {body}")));
+                if OLLAMA_OVERFLOW_MESSAGES.iter().any(|m| body.contains(m)) {
+                    yield Err(StrandsError::ContextWindowOverflow { message: body });
+                } else {
+                    yield Err(StrandsError::model_error(format!("HTTP {status}: {body}")));
+                }
                 return;
             }
 
@@ -291,6 +314,7 @@ impl Model for OllamaModel {
 
             use futures::StreamExt;
             let mut byte_stream = response.bytes_stream();
+            let mut buffer = String::new();
             let mut tool_calls_found: Vec<OllamaToolCall> = Vec::new();
             let mut final_response: Option<OllamaStreamResponse> = None;
 
@@ -303,7 +327,9 @@ impl Model for OllamaModel {
                     }
                 };
 
-                for line in chunk.lines() {
+                buffer.push_str(&chunk);
+
+                for line in super::drain_complete_lines(&mut buffer) {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;

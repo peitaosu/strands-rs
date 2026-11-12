@@ -308,6 +308,31 @@ impl GraphBuilder {
         self
     }
 
+    /// Sets the graph ID, matching the Python builder name.
+    pub fn set_graph_id(self, id: impl Into<String>) -> Self {
+        self.id(id)
+    }
+
+    /// Sets the maximum number of node executions, matching the Python builder name.
+    pub fn set_max_node_executions(self, max: usize) -> Self {
+        self.max_node_executions(max)
+    }
+
+    /// Sets the execution timeout, matching the Python builder name.
+    pub fn set_execution_timeout(self, timeout: Duration) -> Self {
+        self.execution_timeout(timeout)
+    }
+
+    /// Sets the node timeout, matching the Python builder name.
+    pub fn set_node_timeout(self, timeout: Duration) -> Self {
+        self.node_timeout(timeout)
+    }
+
+    /// Sets the hook registry, matching the Python builder name.
+    pub fn set_hook_providers(self, hooks: HookRegistry) -> Self {
+        self.hooks(hooks)
+    }
+
     /// Builds the graph.
     pub fn build(self) -> Result<Graph> {
         if self.nodes.is_empty() {
@@ -448,7 +473,7 @@ impl Graph {
         let task_str = task.to_string_lossy();
 
         Box::pin(async_stream::stream! {
-            self.hooks.invoke(&HookEvent::BeforeInvocation(BeforeInvocationEvent)).await;
+            self.hooks.fire_and_forget(HookEvent::BeforeInvocation(BeforeInvocationEvent::default())).await;
 
             self.state = GraphState {
                 status: Status::Executing,
@@ -498,9 +523,10 @@ impl Graph {
 
                 yield MultiAgentEvent::node_start(&node_id, "agent");
 
-                self.hooks.invoke(&HookEvent::BeforeToolCall(BeforeToolCallEvent::new(
+                let (before_event, _) = self.hooks.fire(HookEvent::BeforeToolCall(BeforeToolCallEvent::new(
                     ToolUse::new(&node_id, &node_id, serde_json::json!({}))
                 ))).await;
+                let _ = before_event;
 
                 let result = self.execute_node(&node_id, &task_str).await;
 
@@ -562,7 +588,7 @@ impl Graph {
                     }
                 }
 
-                self.hooks.invoke(&HookEvent::AfterToolCall(AfterToolCallEvent::new(
+                let _ = self.hooks.fire(HookEvent::AfterToolCall(AfterToolCallEvent::new(
                     ToolUse::new(&node_id, &node_id, serde_json::json!({})),
                     ToolResultType::success(&node_id, "completed")
                 ))).await;
@@ -579,7 +605,7 @@ impl Graph {
                 .map(|s| s.elapsed().as_millis() as u64)
                 .unwrap_or(0);
 
-            self.hooks.invoke(&HookEvent::AfterInvocation(AfterInvocationEvent::new(None))).await;
+            self.hooks.fire_and_forget(HookEvent::AfterInvocation(AfterInvocationEvent::new(None))).await;
 
             let result = MultiAgentResult {
                 status: self.state.status,
@@ -609,7 +635,7 @@ impl Graph {
         let agent_result = node.agent.invoke_async(input.as_str()).await?;
         let execution_time_ms = start.elapsed().as_millis() as u64;
 
-        let usage = agent_result.usage.clone();
+        let usage = agent_result.usage().cloned().unwrap_or_default();
 
         Ok(NodeResult {
             result: NodeResultValue::Agent(agent_result),
@@ -692,6 +718,7 @@ impl MultiAgentBase for Graph {
         if let Some(status_str) = payload.get("status").and_then(|v| v.as_str()) {
             self.state.status = match status_str {
                 "pending" => Status::Pending,
+                "dispatched" => Status::Dispatched,
                 "executing" => Status::Executing,
                 "completed" => Status::Completed,
                 "failed" => Status::Failed,

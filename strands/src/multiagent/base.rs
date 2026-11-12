@@ -17,6 +17,9 @@ use crate::types::streaming::{Metrics, Usage};
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Pending,
+    /// The node was dispatched for execution but has not completed; prevents
+    /// fan-in double-execution on resume.
+    Dispatched,
     Executing,
     Completed,
     Failed,

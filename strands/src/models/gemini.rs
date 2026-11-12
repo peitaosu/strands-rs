@@ -204,6 +204,68 @@ impl Model for GeminiModel {
         self.config = config;
     }
 
+    /// Counts input tokens through the native Gemini `countTokens` API.
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> Result<u64, StrandsError> {
+        let api_key = self.api_key()?;
+        let api_key = if api_key.is_empty() {
+            std::env::var("GOOGLE_API_KEY").map_err(|_| StrandsError::ConfigurationError {
+                message: "Gemini API key not configured. Set GOOGLE_API_KEY or provide api_key".into(),
+            })?
+        } else {
+            api_key.to_string()
+        };
+
+        let mut contents = self.convert_messages(messages);
+        if let Some(prompt) = system_prompt {
+            contents.insert(
+                0,
+                GeminiContent {
+                    role: "user".to_string(),
+                    parts: vec![GeminiPart::Text { text: prompt.to_string() }],
+                },
+            );
+        }
+
+        let url = format!("{}/models/{}:countTokens", self.base_url(), self.config.model_id);
+        let response = self
+            .client
+            .post(&url)
+            .query(&[("key", api_key.as_str())])
+            .json(&serde_json::json!({ "contents": contents }))
+            .send()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("gemini countTokens request failed: {}", e),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StrandsError::ProviderTokenCountError {
+                message: format!("gemini countTokens failed: HTTP {status}: {body}"),
+            });
+        }
+
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("failed to parse countTokens response: {}", e),
+            })?;
+
+        payload
+            .get("totalCount")
+            .and_then(|t| t.as_u64())
+            .map(|tokens| tokens)
+            .ok_or_else(|| StrandsError::ProviderTokenCountError {
+                message: "countTokens response missing totalCount".to_string(),
+            })
+    }
+
     fn stream<'a>(
         &'a self,
         messages: &'a [Message],

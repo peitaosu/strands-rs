@@ -47,6 +47,11 @@ pub enum MCPTransport {
         url: String,
         headers: HashMap<String, String>,
     },
+    /// Streamable HTTP transport: JSON-RPC over POST with optional SSE responses.
+    StreamableHttp {
+        url: String,
+        headers: HashMap<String, String>,
+    },
 }
 
 /// Filters for controlling which MCP tools are loaded.
@@ -176,6 +181,10 @@ pub struct MCPClient {
     prefix: Option<String>,
     stdio_process: RwLock<Option<Child>>,
     stdio_handles: RwLock<Option<StdioHandles>>,
+    tools_changed_callback: RwLock<Option<Arc<dyn Fn(Vec<String>) + Send + Sync>>>,
+    refresh_in_progress: RwLock<bool>,
+    refresh_pending: RwLock<bool>,
+    auth: Option<super::mcp_auth::BearerTokenSource>,
 }
 
 impl MCPClient {
@@ -190,6 +199,10 @@ impl MCPClient {
             prefix: None,
             stdio_process: RwLock::new(None),
             stdio_handles: RwLock::new(None),
+            tools_changed_callback: RwLock::new(None),
+            refresh_in_progress: RwLock::new(false),
+            refresh_pending: RwLock::new(false),
+            auth: None,
         }
     }
 
@@ -216,6 +229,126 @@ impl MCPClient {
             },
             timeout_secs: 30,
         })
+    }
+
+    /// Creates an MCP client with streamable HTTP transport.
+    pub fn streamable_http(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self::new(MCPServerConfig {
+            name: name.into(),
+            transport: MCPTransport::StreamableHttp {
+                url: url.into(),
+                headers: HashMap::new(),
+            },
+            timeout_secs: 30,
+        })
+    }
+
+    /// Sets custom headers for HTTP-based transports.
+    pub fn with_headers(mut self, headers: HashMap<String, String>) -> Self {
+        match &mut self.config.transport {
+            MCPTransport::Sse { headers: transport_headers, .. }
+            | MCPTransport::StreamableHttp { headers: transport_headers, .. } => {
+                *transport_headers = headers;
+            }
+            MCPTransport::Stdio { .. } => {
+                tracing::warn!("with_headers is ignored on stdio transport");
+            }
+        }
+        self
+    }
+
+    /// Enables OAuth client-credentials authentication for HTTP transports.
+    pub fn with_auth(mut self, auth: super::mcp_auth::BearerTokenSource) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Runs a tool call as a SEP-2663 task and polls it to a terminal state.
+    ///
+    /// Task-augmented execution is supported on the streamable-HTTP
+    /// transport; other transports return an error.
+    pub async fn call_tool_as_task(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        tasks_config: &super::mcp_tasks::TasksConfig,
+    ) -> Result<super::mcp_tasks::MCPTask> {
+        use super::mcp_tasks::{parse_task, task_params, tasks_get_params, MCPTaskState};
+
+        if !matches!(tasks_config, super::mcp_tasks::TasksConfig::Disabled) {
+            if !matches!(
+                &self.config.transport,
+                MCPTransport::StreamableHttp { .. }
+            ) {
+                return Err(StrandsError::ToolProviderError {
+                    message: "task-augmented execution requires the streamable HTTP transport"
+                        .to_string(),
+                });
+            }
+        }
+
+        let url = match &self.config.transport {
+            MCPTransport::StreamableHttp { url, .. } => url.clone(),
+            _ => return Err(StrandsError::ToolProviderError {
+                message: "no streamable HTTP endpoint configured".to_string(),
+            }),
+        };
+
+        let create_request = json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+                "task": task_params(None),
+            }
+        });
+
+        let created = self
+            .call_tool_json_rpc(&url, &create_request)
+            .await?;
+        let mut task = parse_task(&created).ok_or_else(|| StrandsError::ToolProviderError {
+            message: "task-augmented tools/call returned no task".to_string(),
+        })?;
+
+        let poll_interval = tasks_config.poll_interval();
+        while !task.state.is_terminal() {
+            tokio::time::sleep(poll_interval).await;
+
+            let poll = json!({
+                "jsonrpc": "2.0",
+                "id": uuid::Uuid::new_v4().to_string(),
+                "method": "tasks/get",
+                "params": tasks_get_params(&task.task_id),
+            });
+            let polled = self.call_tool_json_rpc(&url, &poll).await?;
+            if let Some(updated) = parse_task(&polled) {
+                task = updated;
+            }
+        }
+
+        if task.state == MCPTaskState::Failed || task.state == MCPTaskState::InputDeclined {
+            return Err(StrandsError::ToolProviderError {
+                message: format!(
+                    "task '{}' ended in state {}",
+                    task.task_id,
+                    task.state.as_str()
+                ),
+            });
+        }
+
+        Ok(task)
+    }
+
+    async fn call_tool_json_rpc(&self, url: &str, payload: &serde_json::Value) -> Result<serde_json::Value> {
+        let headers = match &self.config.transport {
+            MCPTransport::StreamableHttp { headers, .. } => {
+                self.resolve_headers(headers).await?
+            }
+            _ => HashMap::new(),
+        };
+        MCPAgentTool::post_json_rpc(url, &headers, payload, self.config.timeout_secs).await
     }
 
     /// Sets tool filters for this client.
@@ -275,15 +408,303 @@ impl MCPClient {
         result
     }
 
+    /// Debounce window for `notifications/tools/list_changed`, matching the
+    /// Python `_TOOLS_CHANGED_DEBOUNCE_SECONDS`.
+    const TOOLS_CHANGED_DEBOUNCE_MS: u64 = 300;
+
+    /// Registers the callback fired after a tools-changed refresh completes.
+    pub async fn set_tools_changed_callback(
+        &self,
+        callback: Arc<dyn Fn(Vec<String>) + Send + Sync>,
+    ) {
+        *self.tools_changed_callback.write().await = Some(callback);
+    }
+
+    /// Re-lists tools from the server, replacing the loaded set.
+    ///
+    /// Keeps other consumers' tools intact per server: only this client's
+    /// own tool map is replaced.
+    pub async fn refresh_tools(&self) -> Result<()> {
+        match &self.config.transport {
+            MCPTransport::Sse { url, headers } => {
+                let headers = self.resolve_headers(headers).await?;
+                self.connect_sse(url, &headers).await
+            }
+            MCPTransport::StreamableHttp { url, headers } => {
+                let headers = self.resolve_headers(headers).await?;
+                self.connect_streamable_http(url, &headers).await
+            }
+            MCPTransport::Stdio { .. } => self.refresh_stdio_tools().await,
+        }
+    }
+
+    /// Handles a `notifications/tools/list_changed` notification.
+    ///
+    /// Debounces bursts and coalesces concurrent refreshes: while a refresh
+    /// is in flight, a pending flag schedules exactly one follow-up pass.
+    pub async fn handle_tools_changed(&self) -> Result<()> {
+        if *self.refresh_in_progress.read().await {
+            *self.refresh_pending.write().await = true;
+            return Ok(());
+        }
+        *self.refresh_in_progress.write().await = true;
+
+        tokio::time::sleep(Duration::from_millis(Self::TOOLS_CHANGED_DEBOUNCE_MS)).await;
+
+        let outcome = loop {
+            let result = self.refresh_tools().await;
+            if *self.refresh_pending.read().await {
+                *self.refresh_pending.write().await = false;
+                if result.is_err() {
+                    break result;
+                }
+                continue;
+            }
+            break result;
+        };
+
+        *self.refresh_in_progress.write().await = false;
+
+        if let Ok(()) = outcome {
+            let names = self.tools.read().await.keys().cloned().collect::<Vec<_>>();
+            if let Some(callback) = &*self.tools_changed_callback.read().await {
+                callback(names);
+            }
+        }
+
+        outcome
+    }
+
+    /// Sends a fresh `tools/list` request over the connected stdio session.
+    async fn refresh_stdio_tools(&self) -> Result<()> {
+        let handles = self
+            .stdio_handles
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| StrandsError::MCPClientInitializationError {
+                message: "MCP stdio transport is not connected".to_string(),
+            })?;
+
+        static REFRESH_REQUEST_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(9000);
+        let request_id = REFRESH_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/list",
+            "params": {}
+        });
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            StrandsError::ToolProviderError {
+                message: format!("Failed to serialize tools/list request: {}", e),
+            }
+        })?;
+
+        {
+            let mut stdin_guard = handles.stdin.lock().await;
+            use tokio::io::AsyncWriteExt;
+            stdin_guard
+                .write_all(format!("{}\n", request_json).as_bytes())
+                .await
+                .map_err(|e| StrandsError::ToolProviderError {
+                    message: format!("Failed to write tools/list request: {}", e),
+                })?;
+            stdin_guard.flush().await.map_err(|e| {
+                StrandsError::ToolProviderError {
+                    message: format!("Failed to flush stdin: {}", e),
+                }
+            })?;
+        }
+
+        let mut line_buf = String::new();
+        loop {
+            let read_result = {
+                let mut stdout_guard = handles.stdout.lock().await;
+                timeout(
+                    Duration::from_secs(handles.timeout_secs),
+                    stdout_guard.read_line(&mut line_buf),
+                )
+                .await
+            };
+
+            let read = match read_result {
+                Ok(Ok(read)) => read,
+                Ok(Err(e)) => {
+                    return Err(StrandsError::ToolProviderError {
+                        message: format!("Failed to read tools/list response: {}", e),
+                    });
+                }
+                Err(_) => {
+                    return Err(StrandsError::ToolProviderError {
+                        message: "Timeout while waiting for tools/list response".to_string(),
+                    });
+                }
+            };
+            if read == 0 {
+                return Err(StrandsError::ToolProviderError {
+                    message: "EOF while waiting for tools/list response".to_string(),
+                });
+            }
+
+            let Ok(response) = serde_json::from_str::<serde_json::Value>(&line_buf) else {
+                line_buf.clear();
+                continue;
+            };
+            line_buf.clear();
+
+            if response.get("id").and_then(|v| v.as_u64()) != Some(request_id) {
+                continue;
+            }
+
+            let Some(result) = response.get("result") else {
+                return Err(StrandsError::ToolProviderError {
+                    message: "tools/list response carried no result".to_string(),
+                });
+            };
+
+            let specs = result
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut tools_map = self.tools.write().await;
+            tools_map.clear();
+            for tool_value in specs {
+                if let Ok(tool_spec) = serde_json::from_value::<MCPToolSpec>(tool_value) {
+                    let tool_name = if let Some(prefix) = &self.prefix {
+                        format!("{}_{}", prefix, tool_spec.name)
+                    } else {
+                        tool_spec.name.clone()
+                    };
+
+                    if let Some(ref filters) = self.filters {
+                        if !filters.should_include(&tool_spec.name) {
+                            continue;
+                        }
+                    }
+
+                    let handles = self.stdio_handles.read().await.clone();
+                    let mcp_tool = Arc::new(MCPAgentTool::new_stdio(
+                        tool_spec,
+                        handles,
+                        self.prefix.clone(),
+                    ));
+                    tools_map.insert(tool_name, mcp_tool);
+                }
+            }
+
+            tracing::debug!(
+                tool_count = tools_map.len(),
+                "MCP stdio tools refreshed"
+            );
+            return Ok(());
+        }
+    }
+
     async fn do_connect(&self) -> Result<()> {
         match &self.config.transport {
             MCPTransport::Stdio { command, args, env } => {
                 self.connect_stdio(command, args, env).await
             }
             MCPTransport::Sse { url, headers } => {
-                self.connect_sse(url, headers).await
+                let headers = self.resolve_headers(headers).await?;
+                self.connect_sse(url, &headers).await
+            }
+            MCPTransport::StreamableHttp { url, headers } => {
+                let headers = self.resolve_headers(headers).await?;
+                self.connect_streamable_http(url, &headers).await
             }
         }
+    }
+
+    /// Merges client credentials bearer headers into the transport headers.
+    async fn resolve_headers(&self, headers: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+        match &self.auth {
+            Some(source) => {
+                let mut resolved = source.auth_headers().await?;
+                resolved.extend(headers.clone());
+                Ok(resolved)
+            }
+            None => Ok(headers.clone()),
+        }
+    }
+
+    /// Connects over streamable HTTP: initialize, then tools/list, both as
+    /// JSON-RPC POSTs.
+    async fn connect_streamable_http(&self, url: &str, headers: &HashMap<String, String>) -> Result<()> {
+        static HTTP_CONNECT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let initialize_id =
+            HTTP_CONNECT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "strands-rs", "version": env!("CARGO_PKG_VERSION")}
+            }
+        });
+
+        MCPAgentTool::post_json_rpc(url, headers, &initialize, self.config.timeout_secs).await?;
+
+        let list_id = HTTP_CONNECT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let list_request = json!({
+            "jsonrpc": "2.0",
+            "id": list_id,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        let response =
+            MCPAgentTool::post_json_rpc(url, headers, &list_request, self.config.timeout_secs).await?;
+
+        let tools = response
+            .get("result")
+            .and_then(|result| result.get("tools"))
+            .and_then(|tools| tools.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        {
+            let mut tools_map = self.tools.write().await;
+            tools_map.clear();
+            for tool_value in tools {
+                if let Ok(tool_spec) = serde_json::from_value::<MCPToolSpec>(tool_value) {
+                    let tool_name = if let Some(prefix) = &self.prefix {
+                        format!("{}_{}", prefix, tool_spec.name)
+                    } else {
+                        tool_spec.name.clone()
+                    };
+
+                    if let Some(ref filters) = self.filters {
+                        if !filters.should_include(&tool_spec.name) {
+                            continue;
+                        }
+                    }
+
+                    let agent_tool = MCPAgentTool::new_streamable_http(
+                        tool_spec,
+                        url.to_string(),
+                        headers.clone(),
+                        self.config.timeout_secs,
+                        self.prefix.clone(),
+                    );
+                    tools_map.insert(tool_name, Arc::new(agent_tool));
+                }
+            }
+        }
+
+        let tool_count = self.tools.read().await.len();
+        tracing::debug!(
+            tool_count,
+            "MCP streamable HTTP transport connected and tools loaded"
+        );
+        Ok(())
     }
 
     async fn connect_stdio(
@@ -670,6 +1091,7 @@ pub struct MCPAgentTool {
     timeout_secs: u64,
     name_override: Option<String>,
     stdio_handles: Option<StdioHandles>,
+    streamable_http: bool,
 }
 
 impl MCPAgentTool {
@@ -689,6 +1111,27 @@ impl MCPAgentTool {
             timeout_secs,
             name_override,
             stdio_handles: None,
+            streamable_http: false,
+        }
+    }
+
+    /// Creates a new MCP agent tool for streamable HTTP transport.
+    pub(crate) fn new_streamable_http(
+        mcp_spec: MCPToolSpec,
+        server_url: String,
+        headers: HashMap<String, String>,
+        timeout_secs: u64,
+        prefix: Option<String>,
+    ) -> Self {
+        let name_override = prefix.map(|p| format!("{}_{}", p, mcp_spec.name));
+        Self {
+            mcp_spec,
+            server_url,
+            headers,
+            timeout_secs,
+            name_override,
+            stdio_handles: None,
+            streamable_http: true,
         }
     }
 
@@ -707,6 +1150,7 @@ impl MCPAgentTool {
             timeout_secs,
             name_override,
             stdio_handles,
+            streamable_http: false,
         }
     }
 
@@ -720,7 +1164,142 @@ impl MCPAgentTool {
             return self.call_mcp_stdio(tool_use_id, arguments, handles).await;
         }
 
+        if self.streamable_http {
+            return self.call_mcp_streamable_http(tool_use_id, arguments).await;
+        }
+
         self.call_mcp_sse(tool_use_id, arguments).await
+    }
+
+    /// Calls the MCP server via streamable HTTP transport.
+    ///
+    /// Sends a JSON-RPC `tools/call` POST and parses either a JSON response
+    /// or an SSE response body.
+    async fn call_mcp_streamable_http(
+        &self,
+        tool_use_id: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<MCPToolResult> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(5000);
+
+        let request_id = HTTP_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
+        let call_request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": self.mcp_spec.name,
+                "arguments": arguments
+            }
+        });
+
+        let response = Self::post_json_rpc(
+            &self.server_url,
+            &self.headers,
+            &call_request,
+            self.timeout_secs,
+        )
+        .await?;
+
+        #[derive(Deserialize)]
+        struct CallToolResponse {
+            content: Vec<MCPResultContent>,
+            #[serde(rename = "isError")]
+            is_error: Option<bool>,
+            #[serde(rename = "structuredContent")]
+            structured_content: Option<serde_json::Value>,
+            #[serde(rename = "meta")]
+            metadata: Option<serde_json::Value>,
+        }
+
+        let payload = response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| StrandsError::ToolProviderError {
+                message: "streamable HTTP tools/call response carried no result".to_string(),
+            })?;
+
+        let call_response: CallToolResponse = serde_json::from_value(payload)
+            .map_err(|e| StrandsError::ToolProviderError {
+                message: format!("Failed to parse tools/call result: {}", e),
+            })?;
+
+        Ok(MCPToolResult {
+            status: if call_response.is_error.unwrap_or(false) {
+                "error"
+            } else {
+                "success"
+            }
+            .to_string(),
+            tool_use_id: tool_use_id.to_string(),
+            content: call_response.content,
+            structured_content: call_response.structured_content,
+            metadata: call_response.metadata,
+        })
+    }
+
+    /// POSTs a JSON-RPC payload and returns the result envelope.
+    ///
+    /// Handles both `application/json` and `text/event-stream` responses.
+    async fn post_json_rpc(
+        url: &str,
+        headers: &HashMap<String, String>,
+        payload: &serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| StrandsError::NetworkError(e.to_string()))?;
+
+        let mut request = client
+            .post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .json(payload);
+
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| StrandsError::NetworkError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StrandsError::NetworkError(format!(
+                "MCP server returned status: {status}: {body}"
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("text/event-stream") {
+            let body = response.text().await.unwrap_or_default();
+            for line in body.lines() {
+                if let Some(json_str) = line.trim().strip_prefix("data: ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        return Ok(value);
+                    }
+                }
+            }
+            return Err(StrandsError::ToolProviderError {
+                message: "SSE response carried no JSON-RPC payload".to_string(),
+            });
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| StrandsError::NetworkError(format!("Failed to parse response: {e}")))
     }
 
     /// Calls the MCP server via stdio transport.
@@ -1074,5 +1653,45 @@ mod tests {
 
         assert_eq!(client.config.timeout_secs, 60);
         assert_eq!(client.prefix, Some("my_prefix".to_string()));
+    }
+
+    #[test]
+    fn test_streamable_http_constructor() {
+        let client = MCPClient::streamable_http("stateful", "http://localhost:9000/mcp")
+            .with_headers(HashMap::from([("Authorization".to_string(), "Bearer token".to_string())]));
+
+        match &client.config.transport {
+            MCPTransport::StreamableHttp { url, headers } => {
+                assert_eq!(url, "http://localhost:9000/mcp");
+                assert_eq!(headers.get("Authorization").map(|v| v.as_str()), Some("Bearer token"));
+            }
+            _ => panic!("expected streamable http transport"),
+        }
+    }
+
+    #[test]
+    fn test_streamable_http_agent_tool() {
+        let spec = MCPToolSpec {
+            name: "search".to_string(),
+            description: Some("Search".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+        };
+        let tool = MCPAgentTool::new_streamable_http(
+            spec,
+            "http://localhost:9000/mcp".to_string(),
+            HashMap::new(),
+            30,
+            Some("srv".to_string()),
+        );
+
+        assert_eq!(tool.name(), "srv_search");
+        assert_eq!(tool.tool_type(), "mcp");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_streamable_http_requires_connection_state() {
+        let client = MCPClient::streamable_http("s", "http://localhost:1/mcp");
+        assert_eq!(client.connection_state().await, ConnectionState::Disconnected);
     }
 }

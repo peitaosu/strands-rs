@@ -1,7 +1,6 @@
 //! Tool-related types for agent tools.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// JSON Schema type alias.
 pub type JsonSchema = serde_json::Value;
@@ -16,6 +15,10 @@ pub struct ToolSpec {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<JsonSchema>,
+
+    /// Provider-agnostic hints from MCP tool annotations. Never sent to model providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
 }
 
 impl ToolSpec {
@@ -25,6 +28,7 @@ impl ToolSpec {
             description: description.into(),
             input_schema: InputSchema::default(),
             output_schema: None,
+            annotations: None,
         }
     }
 
@@ -37,12 +41,25 @@ impl ToolSpec {
         self.output_schema = Some(schema);
         self
     }
+
+    pub fn with_annotations(mut self, annotations: serde_json::Value) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
 }
 
 /// Input schema for a tool.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputSchema {
     pub json: JsonSchema,
+}
+
+impl Default for InputSchema {
+    fn default() -> Self {
+        Self {
+            json: serde_json::json!({"type": "object"}),
+        }
+    }
 }
 
 /// A tool configuration containing its specification.
@@ -59,11 +76,20 @@ pub struct ToolUse {
     pub name: String,
     pub tool_use_id: String,
     pub input: serde_json::Value,
+
+    /// Signature binding the tool use to its reasoning content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
 }
 
 impl ToolUse {
     pub fn new(name: impl Into<String>, tool_use_id: impl Into<String>, input: serde_json::Value) -> Self {
-        Self { name: name.into(), tool_use_id: tool_use_id.into(), input }
+        Self {
+            name: name.into(),
+            tool_use_id: tool_use_id.into(),
+            input,
+            reasoning_signature: None,
+        }
     }
 
     pub fn get_param<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
@@ -221,25 +247,40 @@ pub struct ToolConfig {
 }
 
 /// Context provided to a tool during execution.
+///
+/// Mirrors the Python `ToolContext`: the tool use request, the invocation
+/// state shared across the cycle, and the agent's cancellation signal.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub tool_use: ToolUse,
-    pub invocation_state: HashMap<String, serde_json::Value>,
+    pub invocation_state: crate::tools::InvocationState,
+    pub cancel_signal: Option<crate::async_utils::CancelSignal>,
 }
 
 impl ToolContext {
     pub fn new(tool_use: ToolUse) -> Self {
-        Self { tool_use, invocation_state: HashMap::new() }
+        Self { tool_use, invocation_state: crate::tools::InvocationState::new(), cancel_signal: None }
     }
 
-    pub fn with_state(tool_use: ToolUse, state: HashMap<String, serde_json::Value>) -> Self {
-        Self { tool_use, invocation_state: state }
+    pub fn with_state(tool_use: ToolUse, state: crate::tools::InvocationState) -> Self {
+        Self { tool_use, invocation_state: state, cancel_signal: None }
+    }
+
+    pub fn with_cancel_signal(mut self, cancel_signal: crate::async_utils::CancelSignal) -> Self {
+        self.cancel_signal = Some(cancel_signal);
+        self
+    }
+
+    /// Returns true when cancellation has been requested on the shared signal.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_signal.as_ref().map(|s| s.is_set()).unwrap_or(false)
     }
 
     pub fn get_state<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.invocation_state.get(key).and_then(|v| T::deserialize(v).ok())
+        self.invocation_state.get(key)
     }
 
+    /// Interrupt identifier for a named interrupt raised from this tool call.
     pub fn interrupt_id(&self, name: &str) -> String {
         format!(
             "v1:tool_call:{}:{}",
@@ -258,6 +299,28 @@ mod tests {
         let spec = ToolSpec::new("get_weather", "Get weather for a location");
         assert_eq!(spec.name, "get_weather");
         assert_eq!(spec.description, "Get weather for a location");
+        assert!(spec.annotations.is_none());
+    }
+
+    #[test]
+    fn test_tool_spec_annotations() {
+        let spec = ToolSpec::new("get_weather", "Get weather").with_annotations(serde_json::json!({"readOnlyHint": true}));
+        assert_eq!(spec.annotations.as_ref().and_then(|a| a.get("readOnlyHint")).and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn test_tool_use_reasoning_signature() {
+        let mut tool_use = ToolUse::new("calc", "1", serde_json::json!({}));
+        assert!(tool_use.reasoning_signature.is_none());
+        tool_use.reasoning_signature = Some("sig".to_string());
+        assert_eq!(tool_use.reasoning_signature.as_deref(), Some("sig"));
+    }
+
+    #[test]
+    fn test_tool_context_interrupt_id() {
+        let context = ToolContext::new(ToolUse::new("calc", "42", serde_json::json!({})));
+        let id = context.interrupt_id("approval");
+        assert!(id.starts_with("v1:tool_call:42:"));
     }
 
     #[test]

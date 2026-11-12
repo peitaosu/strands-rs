@@ -38,7 +38,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 
 # UUID
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 
 # Base64 encoding
 base64 = { workspace = true }
@@ -61,6 +61,7 @@ reqwest = { workspace = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tracing-subscriber = { workspace = true }
+mockito = "1"
 
 [features]
 default = ["macros"]

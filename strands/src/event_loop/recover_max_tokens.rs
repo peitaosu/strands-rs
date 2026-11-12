@@ -71,10 +71,10 @@ pub fn recover_message_on_max_tokens_reached(message: Message) -> Message {
         }
     }
 
-    Message {
-        role: message.role,
-        content: valid_content,
-    }
+    let mut recovered = Message::new(message.role, valid_content);
+    recovered.tracking_id = message.tracking_id;
+    recovered.metadata = message.metadata;
+    recovered
 }
 
 #[cfg(test)]
@@ -84,19 +84,12 @@ mod tests {
     use crate::types::tools::ToolUse;
 
     fn make_tool_use(name: &str) -> ContentBlock {
-        ContentBlock::tool_use(ToolUse {
-            name: name.to_string(),
-            tool_use_id: "test-id".to_string(),
-            input: serde_json::json!({}),
-        })
+        ContentBlock::tool_use(ToolUse::new(name, "test-id", serde_json::json!({})))
     }
 
     #[test]
     fn test_recover_message_with_incomplete_tool_use() {
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![make_tool_use("calculator")],
-        };
+        let message = Message::new(Role::Assistant, vec![make_tool_use("calculator")]);
 
         let result = recover_message_on_max_tokens_reached(message);
 
@@ -110,14 +103,10 @@ mod tests {
 
     #[test]
     fn test_recover_message_with_missing_tool_name() {
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::tool_use(ToolUse {
-                name: String::new(),
-                tool_use_id: "test-id".to_string(),
-                input: serde_json::json!({}),
-            })],
-        };
+        let message = Message::new(
+            Role::Assistant,
+            vec![ContentBlock::tool_use(ToolUse::new("", "test-id", serde_json::json!({})))],
+        );
 
         let result = recover_message_on_max_tokens_reached(message);
 
@@ -127,14 +116,14 @@ mod tests {
 
     #[test]
     fn test_recover_message_preserves_non_tool_content() {
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![
+        let message = Message::new(
+            Role::Assistant,
+            vec![
                 ContentBlock::text("Hello"),
                 make_tool_use("calculator"),
                 ContentBlock::text("World"),
             ],
-        };
+        );
 
         let result = recover_message_on_max_tokens_reached(message);
 
@@ -152,10 +141,7 @@ mod tests {
 
     #[test]
     fn test_recover_message_with_empty_content() {
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![],
-        };
+        let message = Message::new(Role::Assistant, vec![]);
 
         let result = recover_message_on_max_tokens_reached(message);
 
@@ -164,13 +150,13 @@ mod tests {
 
     #[test]
     fn test_recover_message_multiple_incomplete_tools() {
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![
+        let message = Message::new(
+            Role::Assistant,
+            vec![
                 make_tool_use("tool1"),
                 make_tool_use("tool2"),
             ],
-        };
+        );
 
         let result = recover_message_on_max_tokens_reached(message);
 
@@ -184,10 +170,7 @@ mod tests {
 
     #[test]
     fn test_recover_message_preserves_user_role() {
-        let message = Message {
-            role: Role::User,
-            content: vec![make_tool_use("test")],
-        };
+        let message = Message::new(Role::User, vec![make_tool_use("test")]);
 
         let result = recover_message_on_max_tokens_reached(message);
 

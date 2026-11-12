@@ -31,6 +31,9 @@ pub struct AgentBuilder {
     trace_attributes: std::collections::HashMap<String, String>,
     max_tool_calls: Option<usize>,
     structured_output_context: Option<StructuredOutputContext>,
+    limits: super::Limits,
+    retry_strategy: crate::event_loop::ModelRetryStrategy,
+    middleware_registry: Option<crate::middleware::MiddlewareRegistry>,
 }
 
 impl Default for AgentBuilder {
@@ -50,10 +53,13 @@ impl AgentBuilder {
             state: AgentState::new(),
             hooks: HookRegistry::new(),
             conversation_manager: None,
-            record_direct_tool_call: false,
+            record_direct_tool_call: true,
             trace_attributes: std::collections::HashMap::new(),
             max_tool_calls: None,
             structured_output_context: None,
+            limits: super::Limits::default(),
+            retry_strategy: crate::event_loop::ModelRetryStrategy::default(),
+            middleware_registry: None,
         }
     }
 
@@ -196,6 +202,27 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the invocation limits for the agent.
+    pub fn limits(mut self, limits: super::Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Sets the model retry strategy.
+    pub fn retry_strategy(mut self, strategy: crate::event_loop::ModelRetryStrategy) -> Self {
+        self.retry_strategy = strategy;
+        self
+    }
+
+    /// Sets the middleware registry.
+    pub fn middleware_registry(
+        mut self,
+        registry: crate::middleware::MiddlewareRegistry,
+    ) -> Self {
+        self.middleware_registry = Some(registry);
+        self
+    }
+
     /// Builds the agent.
     pub fn build(self) -> Result<Agent> {
         let model = self.model.ok_or_else(|| StrandsError::ConfigurationError {
@@ -220,6 +247,12 @@ impl AgentBuilder {
             trace_attributes: self.trace_attributes,
             max_tool_calls: self.max_tool_calls,
             structured_output_context: self.structured_output_context,
+            cancel_signal: crate::async_utils::CancelSignal::new(),
+            deferred_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_message: Arc::new(std::sync::Mutex::new(None)),
+            limits: self.limits,
+            retry_strategy: self.retry_strategy,
+            middleware: self.middleware_registry.unwrap_or_default(),
         })
     }
 }

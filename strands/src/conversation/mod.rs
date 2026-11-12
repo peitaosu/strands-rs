@@ -1,5 +1,9 @@
 //! Conversation management for context window optimization.
 
+pub mod truncate;
+
+pub use truncate::{truncate_text, TruncatingConversationManager};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

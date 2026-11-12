@@ -5,8 +5,10 @@
 //! agent lifecycle.
 
 mod recover_max_tokens;
+mod retry;
 
 pub use recover_max_tokens::recover_message_on_max_tokens_reached;
+pub use retry::ModelRetryStrategy;
 
 use std::any::Any;
 use std::collections::HashMap;

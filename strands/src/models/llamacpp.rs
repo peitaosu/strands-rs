@@ -170,6 +170,56 @@ impl Model for LlamaCppModel {
         self.config = config;
     }
 
+    /// Counts input tokens through the llama.cpp server `/tokenize` endpoint.
+    async fn count_tokens(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> Result<u64, StrandsError> {
+        let text: String = self
+            .convert_messages(messages, system_prompt)
+            .iter()
+            .map(|message| match &message.content {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let response = self
+            .client
+            .post(format!("{}/tokenize", self.llamacpp_config.base_url))
+            .json(&serde_json::json!({ "content": text }))
+            .send()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("llamacpp tokenize request failed: {}", e),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StrandsError::ProviderTokenCountError {
+                message: format!("llamacpp tokenize failed: HTTP {status}: {body}"),
+            });
+        }
+
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| StrandsError::ProviderTokenCountError {
+                message: format!("failed to parse tokenize response: {}", e),
+            })?;
+
+        payload
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .map(|tokens| tokens.len() as u64)
+            .ok_or_else(|| StrandsError::ProviderTokenCountError {
+                message: "tokenize response missing tokens".to_string(),
+            })
+    }
+
     fn stream<'a>(
         &'a self,
         messages: &'a [Message],

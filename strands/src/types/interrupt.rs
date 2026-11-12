@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::content::Message;
+
 /// An interrupt for pausing execution and requesting human input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interrupt {
@@ -40,6 +42,16 @@ impl Interrupt {
     }
 }
 
+/// A tool cycle interrupted before completion, stored so that a resume can
+/// replay tool execution without a new model call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingToolExecution {
+    /// The assistant message that requested the tools.
+    pub assistant_message: Message,
+    /// Results for tool uses that completed before the interruption.
+    pub completed_tool_results: Vec<crate::types::tools::ToolResult>,
+}
+
 /// State for managing interrupts during agent execution.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterruptState {
@@ -49,6 +61,9 @@ pub struct InterruptState {
     pub context: HashMap<String, serde_json::Value>,
     /// True if agent is in an interrupt state, False otherwise.
     pub activated: bool,
+    /// Tool execution waiting to be replayed on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_tool_execution: Option<PendingToolExecution>,
 }
 
 impl InterruptState {
@@ -68,6 +83,29 @@ impl InterruptState {
         self.interrupts.clear();
         self.context.clear();
         self.activated = false;
+    }
+
+    /// Ends the tool cycle after interrupts stopped tool execution.
+    ///
+    /// Interrupts are retained for resume; the interrupt flag deactivates
+    /// and any pending replay record is cleared, matching the Python
+    /// `_InterruptState.end_tool_cycle`.
+    pub fn end_tool_cycle(&mut self) {
+        self.activated = false;
+        self.pending_tool_execution = None;
+    }
+
+    /// Ends the interrupt cycle after responses were applied.
+    ///
+    /// Interrupts, context, and any pending tool execution are cleared.
+    pub fn end_interrupt_cycle(&mut self) {
+        self.deactivate();
+        self.pending_tool_execution = None;
+    }
+
+    /// Marks a tool cycle as pending replay on resume.
+    pub fn set_pending_tool_execution(&mut self, pending: PendingToolExecution) {
+        self.pending_tool_execution = Some(pending);
     }
 
     /// Configure the interrupt state if resuming from an interrupt event.
@@ -135,6 +173,12 @@ impl InterruptState {
         );
         dict.insert("context".to_string(), serde_json::json!(self.context));
         dict.insert("activated".to_string(), serde_json::json!(self.activated));
+        if let Some(pending) = &self.pending_tool_execution {
+            dict.insert(
+                "pending_tool_execution".to_string(),
+                serde_json::to_value(pending).unwrap_or_default(),
+            );
+        }
         dict
     }
 
@@ -168,10 +212,15 @@ impl InterruptState {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let pending_tool_execution = data
+            .get("pending_tool_execution")
+            .and_then(|v| serde_json::from_value::<PendingToolExecution>(v.clone()).ok());
+
         Self {
             interrupts,
             context,
             activated,
+            pending_tool_execution,
         }
     }
 }
